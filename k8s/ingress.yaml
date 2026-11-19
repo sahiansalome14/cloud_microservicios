@@ -1,0 +1,67 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bookstore-ingress
+  annotations:
+    kubernetes.io/ingress.class: apisix
+spec:
+  ingressClassName: apisix
+  rules:
+    - http:
+        paths:
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 5001
+          - path: /api/v1/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 5001
+          - path: /api/events
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 5001
+          - path: /api/v1/events
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 5001
+          - path: /api/books
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog-service
+                port:
+                  number: 5002
+          - path: /api/v1/books
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog-service
+                port:
+                  number: 5002
+          - path: /api/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: orders-service
+                port:
+                  number: 5003
+          - path: /api/v1/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: orders-service
+                port:
+                  number: 5003

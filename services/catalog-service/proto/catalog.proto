@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package catalog;
+
+service CatalogService {
+  rpc ReserveBooks (ReserveRequest) returns (ReserveResponse);
+}
+
+message OrderItem {
+  string bookId = 1;
+  int32 quantity = 2;
+}
+
+message ReserveRequest {
+  repeated OrderItem items = 1;
+}
+
+message ReservedBook {
+  string bookId = 1;
+  string isbn = 2;
+  string title = 3;
+  string author = 4;
+  double unitPrice = 5;
+  int32 quantity = 6;
+}
+
+message ReserveResponse {
+  repeated ReservedBook items = 1;
+}

@@ -1,0 +1,6 @@
+# Netlify Redirects & Proxy Rules
+# Redirige el tráfico /api/* hacia el Load Balancer de AWS (APISIX en EKS)
+/api/*  http://a92ed4ffdd1534b21910876c6c7b59b7-1390404084.us-east-1.elb.amazonaws.com/api/:splat  200!
+
+# SPA Fallback (para React Router)
+/*      /index.html                                                                                  200
