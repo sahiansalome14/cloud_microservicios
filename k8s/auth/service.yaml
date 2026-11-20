@@ -1,0 +1,12 @@
+apiVersion: app/v1
+kind: Service 
+metadata:
+  name: auth-service
+spec:
+  type: ClusterIP 
+  selector:
+    app: auth-microservice
+  ports:
+  - protocol: TCP
+    port: 5001 
+    targetedPort: 5001

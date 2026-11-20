@@ -1,0 +1,12 @@
+apiVersion: app/v1
+kind: ConfigMap
+metadata:
+  name: auth-configmap
+data: 
+  PORT: "5001"
+  API_BASE_PATH: "/api"
+  DB_HOST: "bookstore-db.ctack6qkgxz8.us-east-1.rds.amazonaws.com"
+  DB_NAME: "postgres"
+  DB_SCHEMA: "schema_auth"
+  DB_SSL: "true"
+  DB_SSL_REJECT_UNAUTHORIZED: "false"

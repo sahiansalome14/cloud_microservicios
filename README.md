@@ -7,27 +7,88 @@ Este repositorio contiene una versión funcional de la plataforma operacional
 de BookStore Co. y será utilizado durante diferentes actividades y laboratorios
 del curso.
 
+## Arquitecturas disponibles
+
+El proyecto demuestra la evolución de una aplicación de una arquitectura
+monolítica hacia una arquitectura de microservicios:
+
+### Aplicación monolítica
+
+La implementación ubicada en `backend/` expone una única API para autenticar
+clientes, consultar el catálogo y crear o consultar órdenes. Sus controladores,
+servicios y repositorios forman parte del mismo proceso de Node.js y comparten
+el esquema `schema.sql` y los datos definidos en `database/`.
+
+Esta versión se ejecuta con Docker Compose junto con PostgreSQL y el frontend.
+
+### Versión de microservicios
+
+La implementación ubicada en `services/` separa las responsabilidades en tres
+servicios independientes:
+
+- **Auth Service** (`services/auth-service/`): autenticación de clientes y
+  generación de sesiones/JWT;
+- **Catalog Service** (`services/catalog-service/`): consulta y administración
+  del catálogo de libros. Expone HTTP y un servidor gRPC;
+- **Orders Service** (`services/orders-service/`): creación y consulta de
+  órdenes. Utiliza gRPC para consultar información del catálogo.
+
+Los despliegues de Kubernetes se encuentran en `k8s/`. El manifiesto de Ingress
+enruta las operaciones HTTP a cada servicio. Para la versión de microservicios,
+la inicialización de datos utiliza `schema_microservices.sql` y
+`seed_microservices.sql`, organizados mediante esquemas dedicados por servicio:
+`schema_auth`, `schema_catalog` y `schema_orders`.
+
+### Arquitectura de referencia
+
+```text
+Frontend (React + Nginx)
+        |
+        | HTTP /api
+        |
+        +-------------------- Monolito: backend único
+        |                    PostgreSQL compartido
+        |
+        |-------------------- Auth Service --> schema_auth
+        |                    |
+        |                    + Kubernetes / APISIX Ingress
+        |-------------------- Catalog Service <--> schema_catalog
+        |                    |
+        |                    + gRPC
+        \-------------------- Orders Service --> schema_orders
+                             |
+                             \--> consulta catálogo por gRPC
+```
+
 ## Estructura del repositorio
 
 ```text
 .
-├── frontend/
-├── backend/
+├── frontend/                 # Interfaz React y configuración de Nginx
+├── backend/                  # Versión monolítica
+├── services/
+│   ├── auth-service/         # Microservicio de autenticación
+│   ├── catalog-service/      # Microservicio de catálogo y API gRPC
+│   └── orders-service/       # Microservicio de órdenes
+├── k8s/                      # Deployments, Services, ConfigMaps e Ingress
 ├── database/
-│   ├── schema.sql
-│   ├── seed.sql
+│   ├── schema.sql            # Esquema del monolito
+│   ├── seed.sql              # Datos iniciales del monolito
+│   ├── schema_microservices.sql
+│   ├── seed_microservices.sql
 │   └── rds/
-├── compose.yaml
+├── compose.yaml              # Entorno local del monolito
 └── README.md
 ```
 
 Los principales componentes corresponden a:
 
-- `frontend/`: aplicación web y configuración de Nginx (`frontend/nginx/`);
-- `backend/`: API y lógica de la aplicación;
-- `database/`: esquema, datos iniciales y artefactos relacionados con PostgreSQL;
-- `compose.yaml`: entorno local completo (PostgreSQL, inicialización de la base
-  de datos, backend y frontend).
+- `frontend/`: aplicación web compartida por ambas versiones y configuración de Nginx;
+- `backend/`: API monolítica que agrupa autenticación, catálogo y órdenes;
+- `services/`: servicios independientes utilizados en la arquitectura distribuida;
+- `database/`: esquemas, datos iniciales y artefactos relacionados con PostgreSQL;
+- `k8s/`: recursos de Kubernetes para desplegar los microservicios;
+- `compose.yaml`: entorno local completo (PostgreSQL, inicialización, backend monolítico y frontend).
 
 ## Configuración
 
@@ -61,6 +122,8 @@ y en `database/rds/bootstrap.env.example`: `DB_HOST`, `DB_PORT`, `DB_NAME`,
 `DB_ADMIN_USER`, `DB_ADMIN_PASSWORD`, `INGEST_DB_USER` e `INGEST_DB_PASSWORD`.
 
 ## Ejecución local
+
+### Versión monolítica
 
 ```bash
 docker compose up --build
@@ -113,6 +176,39 @@ npm install
 npm run dev
 ```
 
+### Versión con microservicios en Kubernetes
+
+Los manifiestos permiten desplegar la versión distribuida en un clúster con
+Kubernetes y un Ingress compatible con APISIX:
+
+```bash
+kubectl apply -f k8s/
+kubectl apply -f k8s/auth/
+kubectl apply -f k8s/catalog/
+kubectl apply -f k8s/orders/
+kubectl apply -f k8s/ingress.yaml
+```
+
+Los servicios usan los siguientes puertos internos:
+
+| Servicio | HTTP | gRPC |
+|---|---:|---:|
+| Auth | 5001 | — |
+| Catalog | 5002 | 50051 |
+| Orders | 5003 | — |
+
+Antes del despliegue deben revisarse y parametrizarse las imágenes, credenciales,
+variables de base de datos y secretos incluidos en `k8s/`. No se recomienda
+mantener contraseñas o secretos reales directamente en los manifiestos; para
+producción deben utilizarse Secret, ConfigMap o un gestor externo de secretos.
+
+El esquema distribuido se inicializa con:
+
+```bash
+psql -f database/schema_microservices.sql
+psql -f database/seed_microservices.sql
+```
+
 ### Build del frontend para Amazon S3
 
 ```bash
@@ -126,15 +222,21 @@ código compilado, por lo que no deben contener secretos.
 
 ## Publicar imágenes
 
-Las imágenes del backend y del frontend se publican como **multiplataforma**
-(`linux/amd64` y `linux/arm64`), de modo que funcionan en servidores x86 y ARM
-(Graviton) sin importar el equipo donde se construyeron. El nombre de cada
-imagen se forma con dos variables del `.env`:
+Las imágenes del backend monolítico y del frontend se publican como
+**multiplataforma** (`linux/amd64` y `linux/arm64`). La versión distribuida utiliza
+una imagen independiente para cada microservicio:
 
 ```text
 ${IMAGE_REGISTRY}/bookstore-backend:${IMAGE_TAG}
 ${IMAGE_REGISTRY}/bookstore-frontend:${IMAGE_TAG}
+${IMAGE_REGISTRY}/bookstore-auth:${IMAGE_TAG}
+${IMAGE_REGISTRY}/bookstore-catalog:${IMAGE_TAG}
+${IMAGE_REGISTRY}/bookstore-orders:${IMAGE_TAG}
 ```
+
+Todas las imágenes se pueden construir en servidores x86 o ARM (Graviton), pero
+los servicios de Kubernetes deben referenciar las imágenes disponibles en su
+registro y región.
 
 | Registro   | `IMAGE_REGISTRY`                                 |
 |------------|--------------------------------------------------|
