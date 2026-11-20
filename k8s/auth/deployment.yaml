@@ -21,10 +21,10 @@ spec:
         ports:
         - containerPort: 5001 
         envFrom: 
-          - ConfigMapRef:
-            name: auth-configmap
+          - configMapRef:
+              name: auth-configmap
           - secretRef:
-            name: auth-secret
+              name: auth-secret
 
 
 

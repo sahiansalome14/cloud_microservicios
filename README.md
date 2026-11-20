@@ -39,26 +39,157 @@ la inicialización de datos utiliza `schema_microservices.sql` y
 `seed_microservices.sql`, organizados mediante esquemas dedicados por servicio:
 `schema_auth`, `schema_catalog` y `schema_orders`.
 
-### Arquitectura de referencia
+La versión distribuida utiliza Apache APISIX como puerta de entrada HTTP y
+un Network Load Balancer (NLB) de AWS delante del gateway en la arquitectura
+de despliegue. El NLB se administra en AWS; su definición no forma parte de
+los manifiestos versionados en este repositorio.
+
+### Arquitectura de referencia y flujo de solicitudes
 
 ```text
-Frontend (React + Nginx)
-        |
-        | HTTP /api
-        |
-        +-------------------- Monolito: backend único
-        |                    PostgreSQL compartido
-        |
-        |-------------------- Auth Service --> schema_auth
-        |                    |
-        |                    + Kubernetes / APISIX Ingress
-        |-------------------- Catalog Service <--> schema_catalog
-        |                    |
-        |                    + gRPC
-        \-------------------- Orders Service --> schema_orders
-                             |
-                             \--> consulta catálogo por gRPC
+Frontend (React)
+      |
+      | HTTPS
+      v
+AWS Network Load Balancer (NLB)
+      |
+      | TCP/TLS hacia destinos saludables
+      v
+Apache APISIX (API Gateway / Ingress)
+      |
+      +-- /api/auth, /api/events --> auth-service:5001 --> schema_auth
+      |
+      +-- /api/books ------------> catalog-service:5002 --> schema_catalog
+      |                                  ^
+      |                                  | gRPC ReserveBooks (:50051)
+      +-- /api/orders -----------> orders-service:5003 --> schema_orders
+                                         |
+                                         +---- petición a Catalog
+
+                  PostgreSQL: una instancia RDS, tres esquemas
 ```
+
+El **NLB** actúa en la capa de transporte: expone un punto de acceso para
+clientes y distribuye conexiones hacia los destinos configurados para APISIX.
+El NLB no selecciona microservicios según rutas HTTP. **APISIX** examina las
+rutas de la petición y las envía al Service Kubernetes apropiado según
+`k8s/ingress.yaml`. Esto separa el balanceo externo de conexiones del
+enrutamiento de aplicaciones y permite mantener **una única entrada pública
+para múltiples réplicas o instancias de APISIX**; la distribución exacta
+depende del target group y del tipo de despliegue configurados en AWS/EKS.
+Es una decisión conveniente cuando APISIX centraliza rutas y políticas; si
+un único balanceador HTTP cubriera todas las necesidades, la combinación
+NLB + APISIX podría añadir complejidad innecesaria.
+
+El Ingress define las rutas `/api/auth`, `/api/events`, `/api/books` y
+`/api/orders` (también con prefijo `/api/v1`). Los tres microservicios exponen
+HTTP para clientes externos, pero **solo Catalog expone además un servidor
+gRPC**. Orders actúa como cliente de ese servidor mediante el contrato
+`catalog.proto`. La llamada `ReserveBooks` verifica disponibilidad y descuenta
+stock en Catalog antes de que Orders registre su compra. En este caso es una
+comunicación *solicitud-respuesta*: Orders necesita conocer el resultado para
+continuar. Podría haberse implementado con REST, pero gRPC aporta un contrato
+tipado y serialización Protocol Buffers para esta interacción interna.
+
+### Flujo de autenticación y creación de órdenes
+
+1. El frontend envía `POST /api/auth/login` y APISIX lo enruta a Auth.
+2. Auth consulta `schema_auth.customers` por correo y genera un JWT firmado.
+   El token se envía en una cookie de sesión HTTP.
+3. Al invocar una ruta protegida de Orders, el cliente envía la cookie.
+   Orders **verifica localmente el JWT** con la clave y los parámetros de
+   verificación configurados; no consulta a Auth mediante gRPC para validar
+   cada solicitud.
+4. Orders obtiene el identificador del cliente (`sub` del JWT), llama por
+   gRPC a Catalog para reservar libros y, si la reserva se confirma,
+   persiste la orden y sus detalles en `schema_orders`.
+
+El identificador de cliente en las órdenes referencia de manera **lógica** a
+Auth: no se creó una clave foránea entre esquemas. Si Orders necesitara
+otros datos del cliente (por ejemplo, su nombre), sería conveniente definir
+una API de consulta en Auth o propagar los cambios mediante eventos en lugar
+de leer directamente `schema_auth`.
+
+**Limitación:** el inicio de sesión del ejemplo académico comprueba la
+existencia del correo, sin contraseña. No representa una autenticación apta
+para producción. Además, la reserva de inventario y la escritura de la orden
+ocurren en transacciones de servicios diferentes: no hay una transacción
+distribuida ni una compensación automática documentada si falla la segunda
+operación después de descontar stock.
+
+### Persistencia y aislamiento de datos
+
+Para reducir complejidad y costos se utiliza **una instancia PostgreSQL en
+Amazon RDS con tres esquemas**, según `database/schema_microservices.sql`:
+
+| Microservicio | Esquema | Tablas principales |
+|---|---|---|
+| Auth | `schema_auth` | `customers` |
+| Catalog | `schema_catalog` | `books` |
+| Orders | `schema_orders` | `orders`, `order_items` |
+
+Cada servicio configura `DB_SCHEMA` y su pool de conexiones utiliza
+`search_path=<schema>,public` para resolver las tablas sin prefijo de esquema.
+**`search_path` no es un mecanismo de aislamiento ni control de permisos**:
+un usuario autorizado podría consultar otro esquema con un nombre calificado.
+
+Por simplicidad se definieron **dos usuarios de aplicación/ingesta**, además
+del administrador utilizado durante la inicialización: `app_user` para
+operaciones de la aplicación e `ingest_user` para lectura de datos. El script
+`database/rds/grants_microservices.sql` otorga a `app_user` permisos de
+lectura/escritura en los tres esquemas y a `ingest_user` permisos de lectura
+en los tres. Esto simplifica el laboratorio, pero **representa un riesgo de
+seguridad**: si las credenciales de un microservicio se comprometen, su
+alcance puede extenderse a datos de otros servicios. Para producción, se
+recomienda un usuario por microservicio con privilegios mínimos sobre su
+propio esquema, junto con un usuario de ingesta de solo lectura acotado a
+las tablas estrictamente necesarias.
+
+### Eventos y observabilidad
+
+El frontend genera eventos de comportamiento, como agregar libros al carrito,
+cambiar cantidades o iniciar el checkout. En esta implementación los envía
+por HTTP a `POST /api/events`, que APISIX enruta a **Auth Service**.
+`eventController` serializa el evento como JSON y lo escribe en `stdout`.
+Luego Fluent Bit puede recolectar ese registro y enviarlo a Grafana Loki
+para su consulta en Grafana:
+
+```text
+Frontend --> APISIX --> Auth / eventController --> stdout
+                                                   |
+                                                   v
+                                            Fluent Bit (DaemonSet)
+                                                   |
+                                                   v
+                                              Grafana Loki
+                                                   |
+                                                   v
+                                                 Grafana
+```
+
+**Decisión de alcance:** se dejó el controlador de eventos dentro de Auth
+por simplicidad, porque recibe interacciones generadas por usuarios y se
+evitó añadir otro microservicio. Esto no significa que la recepción de
+eventos sea una responsabilidad propia de autenticación: una arquitectura
+con mayor separación tendría un **Event Service** independiente, encargado
+de validar, recibir y eventualmente publicar eventos en un broker.
+
+**Fluent Bit se despliega como DaemonSet**, no como sidecar de Auth, porque
+no solo interesa conservar los eventos de comportamiento: Catalog, Orders
+y otros Pods también producen logs operacionales en los distintos nodos.
+Una instancia de Fluent Bit por nodo puede leer los archivos de logs de sus
+contenedores y centralizarlos. Si un nodo no ejecuta Auth, aun así puede
+generar logs que queremos conservar. Un sidecar por réplica incrementaría
+el número de agentes y requeriría configurar la entrega de logs desde el
+contenedor de la aplicación.
+
+**Limitación:** enviar eventos a `stdout` y recolectarlos con Fluent Bit/Loki
+es una estrategia de observabilidad; no constituye por sí sola un sistema
+de eventos de negocio con garantías de entrega, reintentos y consumo.
+Si esos eventos fueran críticos, convendría un servicio independiente y una
+cola o broker de mensajes con persistencia y manejo de errores. Asimismo,
+el `eventController` actual no incorpora validación exhaustiva del cuerpo
+ni autenticación obligatoria en su ruta.
 
 ## Estructura del repositorio
 
@@ -178,8 +309,9 @@ npm run dev
 
 ### Versión con microservicios en Kubernetes
 
-Los manifiestos permiten desplegar la versión distribuida en un clúster con
-Kubernetes y un Ingress compatible con APISIX:
+Los manifiestos representan la versión distribuida para Kubernetes y un
+Ingress compatible con APISIX. Una vez revisados y corregidos, se aplican
+mediante:
 
 ```bash
 kubectl apply -f k8s/
@@ -201,6 +333,13 @@ Antes del despliegue deben revisarse y parametrizarse las imágenes, credenciale
 variables de base de datos y secretos incluidos en `k8s/`. No se recomienda
 mantener contraseñas o secretos reales directamente en los manifiestos; para
 producción deben utilizarse Secret, ConfigMap o un gestor externo de secretos.
+**Los manifiestos actuales de Auth requieren correcciones antes de aplicarlos:**
+el `Service` y el `ConfigMap` usan `apiVersion: app/v1` en lugar de `v1`,
+el Service contiene `targetedPort` en vez de `targetPort` y selecciona
+`app: auth-microservice` mientras que el Deployment etiqueta los Pods con
+`app: auth-service`. En `auth/deployment.yaml`, `ConfigMapRef` debe escribirse
+`configMapRef` y anidar `name` dentro de la referencia. También deben
+retirarse y rotarse las credenciales reales que hayan quedado expuestas en Git.
 
 El esquema distribuido se inicializa con:
 

@@ -1,3 +1,4 @@
+// Archivo donde se configura y crea la conexión a postgresql
 import pg from "pg";
 import { config } from "./env.js";
 
